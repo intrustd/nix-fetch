@@ -195,6 +195,7 @@ public:
         if ( public_key_spec.size() == 0 && lines.eof() ) break;
 
         nix::PublicKey public_key(public_key_spec);
+        m_public_keys[public_key.name] = public_key_spec;
         public_keys.emplace(public_key.name, std::move(public_key));
       }
 
@@ -213,9 +214,21 @@ public:
     return std::find_if(begin(), end(), [&p] (auto cache) { return cache.verify_sigs(p); });
   }
 
+  void add_public_keys() const {
+    std::stringstream keys;
+
+    std::transform(m_public_keys.begin(), m_public_keys.end(),
+                   std::ostream_iterator<std::string>(keys, " "),
+                   [] ( auto p ) { return p.second; });
+
+    std::cerr << "Adding " << keys.str();
+    nix::globalConfig.set("trusted-public-keys", keys.str());
+  }
+
 private:
   std::map< std::string, CacheInfo > m_caches;
   std::list< std::string > m_cache_order;
+  std::map< std::string, std::string > m_public_keys;
 };
 
 class DownloadSource {
@@ -223,21 +236,70 @@ public:
   enum Source { Local, Remote };
 
   DownloadSource(CacheInfo::CacheType p)
-    : m_source(Local), m_cache(NULL), m_provenance(p) {
+    : m_source(Local), m_cache(NULL), m_provenance(p), m_downloaded(true) {
   }
 
   DownloadSource(const CacheInfo &cache)
-    : m_source(Remote), m_cache(&cache), m_provenance(cache.type()) {
+    : m_source(Remote), m_cache(&cache), m_provenance(cache.type()), m_downloaded(false) {
   }
 
   bool is_remote() const { return m_cache; }
   const CacheInfo &cache() const { return *m_cache; }
   CacheInfo::CacheType provenance() const { return m_provenance; }
 
+  bool downloaded() const { return m_downloaded; }
+  void mark_downloaded() { m_downloaded = true; }
+
 private:
   Source m_source;
   const CacheInfo *m_cache;
   CacheInfo::CacheType m_provenance;
+
+  bool m_downloaded;
+};
+
+class Downloader {
+public:
+  Downloader(size_t totalSize, nix::ref<nix::Store> localStore,
+             std::map<std::string, DownloadSource> &sources)
+    : m_complete(0), m_totalSize(totalSize),
+      m_lastComplete(0), m_reportSize(m_totalSize / 1000),
+      m_localStore(localStore), m_sources(sources) {
+    if ( m_reportSize == 0 ) m_reportSize = 1;
+  }
+
+  void operator() ( const std::string &path ) {
+    auto &source(m_sources.find(path)->second);
+    if ( !source.downloaded() ) {
+      auto info(source.cache().store()->queryPathInfo(path));
+
+      for ( auto ref: info->references )
+        if ( ref != path )
+          (*this)(ref);
+
+      auto dlSource =
+        nix::sinkToSource([&source, &path, this] ( nix::Sink &sink ) {
+           nix::LambdaSink wrapper([&source, &sink, &path, this] ( const unsigned char *data, size_t len ) {
+                                     sink(data, len);
+                                     m_complete += len;
+                                     if ( (m_complete - m_lastComplete) > m_reportSize ) {
+                                       m_lastComplete = m_complete;
+                                       std::cout << m_complete << " " << m_totalSize << " Downloading " << path << std::endl;
+                                     }
+                                   });
+           source.cache().store()->narFromPath(path, wrapper);
+         });
+
+      m_localStore->addToStore(*info, *dlSource, nix::NoRepair, nix::NoCheckSigs);
+      source.mark_downloaded();
+    }
+  }
+
+private:
+  size_t m_complete, m_totalSize;
+  size_t m_lastComplete, m_reportSize;
+  nix::ref<nix::Store> m_localStore;
+  std::map<std::string, DownloadSource> &m_sources;
 };
 
 void usage() {
@@ -258,11 +320,11 @@ void addPublicKeys(const std::list<const char*> ourKeys) {
   nix::globalConfig.set("trusted-public-keys", keysStr.str());
 }
 
-int main(int argc, char **argv) {
+int _main(int argc, char **argv) {
   std::deque< std::pair<std::string, CacheInfo::CacheType> > paths;
-  std::list< std::string > pathOrder;
+  std::list< std::string > initialPaths;
   CacheSpec caches;
-  bool bAllowUnsourced(false), bVerbose(false);
+  bool bAllowUnsourced(false), bVerbose(false), bVerifyOnly(false);
 
   caches.read_system();
 
@@ -276,7 +338,7 @@ int main(int argc, char **argv) {
         std::fstream is(argv[++i], std::fstream::in);
 
         if ( !is ) {
-          std::cerr << "Could not open " << arg << std::endl;
+          std::cerr << "Could not open " << argv[i] << std::endl;
           return 1;
         }
 
@@ -286,11 +348,15 @@ int main(int argc, char **argv) {
       bAllowUnsourced = true;
     } else if ( arg == "--verbose" ) {
       bVerbose = true;
+    } else if ( arg == "--verify-only" ) {
+      bVerifyOnly = true;
     } else {
-      pathOrder.emplace_front(arg);
+      initialPaths.push_back(arg);
       paths.emplace_back(std::make_pair(std::move(arg), CacheInfo::AppCache));
     }
   }
+
+  caches.add_public_keys();
 
   std::map< std::string, DownloadSource > sources;
   auto localStore(nix::openStore());
@@ -302,6 +368,23 @@ int main(int argc, char **argv) {
     CacheInfo::CacheType provenance(pathAndProv.second);
     paths.pop_front();
 
+    auto add_paths =
+      [&sources, &path, &paths]
+      ( nix::ref<const nix::ValidPathInfo> pi,
+        CacheInfo::CacheType prov ) {
+        for ( auto ref: pi->references ) {
+          auto existing_source(sources.find(ref));
+          if ( existing_source == sources.end() ) {
+            paths.push_back(std::make_pair(ref, prov));
+          } else {
+            if ( existing_source->second.provenance() == CacheInfo::AppCache &&
+                 prov == CacheInfo::SystemCache ) {
+              throw nix::Error(nix::format("The system package %s depends on the app package %s") % path % ref);
+            }
+          }
+        }
+      };
+
     if ( sources.find(path) != sources.end() )
       continue;
 
@@ -311,9 +394,10 @@ int main(int argc, char **argv) {
       CacheSpec::iterator prov(caches.determine_provenance(*found));
 
       if ( prov == caches.end() ) {
-        if ( found->ultimate || (bAllowUnsourced && found->sigs.empty()) )
+        if ( found->ultimate || (bAllowUnsourced && found->sigs.empty()) ) {
           sources.emplace(path, DownloadSource(CacheInfo::SystemCache));
-        else {
+          add_paths(found, CacheInfo::SystemCache);
+        } else {
           // Otherwise, check if any remote store has this path.
           //
           // If so, verify that the hashes match.
@@ -324,6 +408,7 @@ int main(int argc, char **argv) {
               if ( remote->narHash == found->narHash &&
                    cache.verify_sigs(*remote) ) {
                 sources.emplace(path, DownloadSource(cache.type()));
+                add_paths(found, cache.type());
                 break;
               }
             } catch (nix::InvalidPath &) {
@@ -336,8 +421,12 @@ int main(int argc, char **argv) {
         }
       } else {
         sources.emplace(path, DownloadSource(prov->type()));
+        add_paths(found, prov->type());
       }
     } catch ( nix::InvalidPath & ) {
+      if ( bVerifyOnly )
+        throw nix::Error(nix::format("Could not find %s, while verifying") % path);
+
       std::cerr << "Querying caches for " << path << std::endl;
 
       auto cache(std::find_if(caches.begin(), caches.end(),
@@ -371,18 +460,7 @@ int main(int argc, char **argv) {
         throw nix::Error(nix::format("Signature for %s in %s is invalid\n") % path % cache->cache_uri());
       }
 
-      for ( auto ref: found->references ) {
-        auto existing_source(sources.find(ref));
-        if ( existing_source == sources.end() ) {
-          pathOrder.push_front(ref);
-          paths.push_back(std::make_pair(ref, cache->type()));
-        } else {
-          if ( existing_source->second.provenance() == CacheInfo::AppCache &&
-               cache->type() == CacheInfo::SystemCache ) {
-            throw nix::Error(nix::format("The system package %s depends on the app package %s") % path % ref);
-          }
-        }
-      }
+      add_paths(found, cache->type());
     }
   }
 
@@ -409,27 +487,13 @@ int main(int argc, char **argv) {
 
   // Download all the things!
 
-  size_t complete(0);
-  for ( auto path: pathOrder ) {
-    auto &source(*sources.find(path));
-    if ( source.second.is_remote() ) {
-      auto info(source.second.cache().store()->queryPathInfo(source.first));
+  Downloader download(totalNarSize, localStore, sources);
 
-      auto dlSource = nix::sinkToSource
-        ([&source, totalNarSize, &complete] ( nix::Sink &sink ) {
-           nix::LambdaSink wrapper([&source, totalNarSize, &complete, &sink] ( const unsigned char *data, size_t len ) {
-                                     sink(data, len);
-                                     complete += len;
-                                     std::cout << complete << " " << totalNarSize << " Downloading " << source.first << std::endl;
-                                   });
-           source.second.cache().store()->narFromPath(source.first, wrapper);
-         });
-
-      localStore->addToStore(*info, *dlSource, nix::NoRepair, nix::NoCheckSigs);
-    }
+  for ( auto path: initialPaths ) {
+    download(path);
   }
 
-  std::cout << complete << " " << totalNarSize << " Complete";
+  std::cout << totalNarSize << " " << totalNarSize << " Complete";
 
   return 0;
 
@@ -533,4 +597,14 @@ int main(int argc, char **argv) {
   // nix::copyPaths(remoteStore, localStore, willDownload, nix::NoRepair, nix::CheckSigs, nix::Substitute);
 
   // return 0;
+}
+
+
+int main (int argc, char **argv) {
+  try {
+    return _main(argc, argv);
+  } catch (nix::Error &e) {
+    std::cout << "error " << e.what() << std::endl;
+    return 10;
+  }
 }
