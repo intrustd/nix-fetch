@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <iostream>
 #include <iterator>
+#include <cstring>
 
 #include <nix/config.h>
 #include <nix/store-api.hh>
@@ -323,8 +324,9 @@ void addPublicKeys(const std::list<const char*> ourKeys) {
 int _main(int argc, char **argv) {
   std::deque< std::pair<std::string, CacheInfo::CacheType> > paths;
   std::list< std::string > initialPaths;
+  std::string root;
   CacheSpec caches;
-  bool bAllowUnsourced(false), bVerbose(false), bVerifyOnly(false);
+  bool bAllowUnsourced(false), bVerbose(false), bVerifyOnly(false), bAddRoot(false);
 
   caches.read_system();
 
@@ -350,6 +352,15 @@ int _main(int argc, char **argv) {
       bVerbose = true;
     } else if ( arg == "--verify-only" ) {
       bVerifyOnly = true;
+    } else if ( arg == "--add-indirect-root" ) {
+      if ( (i + 1) >= argc ) {
+        std::cerr << "Missing argument for --add-indirect-root" << std::endl;
+        return 1;
+      }
+
+      i++;
+      bAddRoot = true;
+      root = argv[i];
     } else {
       initialPaths.push_back(arg);
       paths.emplace_back(std::make_pair(std::move(arg), CacheInfo::AppCache));
@@ -427,8 +438,6 @@ int _main(int argc, char **argv) {
       if ( bVerifyOnly )
         throw nix::Error(nix::format("Could not find %s, while verifying") % path);
 
-      std::cerr << "Querying caches for " << path << std::endl;
-
       auto cache(std::find_if(caches.begin(), caches.end(),
                               [&path]( const CacheInfo &cache ) {
                                 try {
@@ -495,6 +504,22 @@ int _main(int argc, char **argv) {
 
   std::cout << totalNarSize << " " << totalNarSize << " Complete";
 
+  if ( bAddRoot ) {
+    int err;
+
+    if ( initialPaths.size() > 0 ) {
+      err = symlink(initialPaths.front().c_str(), root.c_str());
+      if ( err < 0 ) {
+        std::cerr << "error Could not create indirect root: " << strerror(errno) << std::endl;
+        return 1;
+      }
+
+      localStore->addIndirectRoot(root);
+    }
+  }
+
+  localStore->syncWithGC();
+
   return 0;
 }
 
@@ -503,6 +528,7 @@ int main (int argc, char **argv) {
     return _main(argc, argv);
   } catch (nix::Error &e) {
     std::cout << "error " << e.what() << std::endl;
+    std::cerr << e.what() << std::endl;
     return 10;
   }
 }
